@@ -1,0 +1,131 @@
+name: Issue Agent
+
+on:
+  issues:
+    types:
+      - labeled
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to process
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  implement:
+    name: Implement issue
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        github.event.label.name == 'agent:run'
+      }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve issue
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          issue_number="${INPUT_ISSUE_NUMBER:-$EVENT_ISSUE_NUMBER}"
+
+          if [ -z "$issue_number" ]; then
+            echo "No issue number was provided."
+            exit 1
+          fi
+
+          title="$(gh issue view "$issue_number" --json title --jq .title)"
+          body="$(gh issue view "$issue_number" --json body --jq .body)"
+
+          {
+            echo "number=$issue_number"
+            echo "title<<EOF"
+            echo "$title"
+            echo "EOF"
+            echo "body<<EOF"
+            echo "$body"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "# Issue #$issue_number: $title"
+            echo
+            echo "$body"
+          } > /tmp/issue-agent-prompt.md
+
+      - name: Configure git
+        run: |
+          git config user.name "issue-agent"
+          git config user.email "issue-agent@users.noreply.github.com"
+
+      - name: Create work branch
+        run: |
+          branch="agent/issue-${{ steps.issue.outputs.number }}"
+          git checkout -B "$branch"
+          echo "AGENT_BRANCH=$branch" >> "$GITHUB_ENV"
+
+      - name: Run configured agent
+        env:
+          AGENT_COMMAND: ${{ vars.AGENT_COMMAND }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+          ISSUE_BODY: ${{ steps.issue.outputs.body }}
+        run: |
+          if [ -z "$AGENT_COMMAND" ]; then
+            echo "Repository variable AGENT_COMMAND is not configured."
+            echo "Add a repository variable named AGENT_COMMAND with the command that should implement the issue."
+            exit 1
+          fi
+
+          bash -lc "$AGENT_COMMAND"
+
+      - name: Detect changes
+        id: changes
+        run: |
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit changes
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          git add .
+          git commit -m "feat: implement issue #${{ steps.issue.outputs.number }}"
+
+      - name: Push branch
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          git push -u origin "$AGENT_BRANCH" --force-with-lease
+
+      - name: Create pull request
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base main \
+            --head "$AGENT_BRANCH" \
+            --title "Implement issue #${{ steps.issue.outputs.number }}: ${{ steps.issue.outputs.title }}" \
+            --body "Closes #${{ steps.issue.outputs.number }}"
+
+      - name: Comment when no changes were produced
+        if: steps.changes.outputs.changed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "${{ steps.issue.outputs.number }}" \
+            --body "Issue Agent ran, but no file changes were produced."
