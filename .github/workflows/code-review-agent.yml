@@ -131,11 +131,7 @@ jobs:
           if len(checks) > max_check_chars:
               checks = checks[-max_check_chars:] + "\n\n[Check output truncated because it is too large.]"
 
-          endpoint = (
-              base_url
-              if base_url.endswith("/chat/completions")
-              else f"{base_url}/chat/completions"
-          )
+          endpoint = base_url
 
           payload = {
               "model": model,
