@@ -1,0 +1,220 @@
+name: Code Review Agent
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  review:
+    name: Review pull request
+    if: >-
+      ${{
+        github.event_name == 'workflow_dispatch' ||
+        github.event.pull_request.draft == false
+      }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          pr_number="${INPUT_PR_NUMBER:-$EVENT_PR_NUMBER}"
+
+          if [ -z "$pr_number" ]; then
+            echo "No pull request number was provided."
+            exit 1
+          fi
+
+          title="$(gh pr view "$pr_number" --json title --jq .title)"
+          body="$(gh pr view "$pr_number" --json body --jq '.body // ""')"
+
+          gh pr diff "$pr_number" --patch > /tmp/pr.diff
+
+          {
+            echo "number=$pr_number"
+            echo "title<<EOF"
+            echo "$title"
+            echo "EOF"
+            echo "body<<EOF"
+            echo "$body"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run optional checks
+        id: checks
+        env:
+          REVIEW_TEST_COMMAND: ${{ vars.REVIEW_TEST_COMMAND }}
+        run: |
+          if [ -z "$REVIEW_TEST_COMMAND" ]; then
+            {
+              echo "No REVIEW_TEST_COMMAND repository variable is configured."
+              echo "The review is based on the pull request diff only."
+            } > /tmp/review-checks.txt
+            echo "exit_code=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          set +e
+          bash -lc "$REVIEW_TEST_COMMAND" > /tmp/review-checks.txt 2>&1
+          exit_code="$?"
+          set -e
+
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+
+      - name: Ask model for review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_TITLE: ${{ steps.pr.outputs.title }}
+          PR_BODY: ${{ steps.pr.outputs.body }}
+          CHECK_EXIT_CODE: ${{ steps.checks.outputs.exit_code }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+          base_url = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
+          model = os.environ.get("OPENAI_MODEL", "").strip()
+
+          missing = [
+              name
+              for name, value in {
+                  "OPENAI_API_KEY": api_key,
+                  "OPENAI_BASE_URL": base_url,
+                  "OPENAI_MODEL": model,
+              }.items()
+              if not value
+          ]
+          if missing:
+              print(f"Missing required configuration: {', '.join(missing)}", file=sys.stderr)
+              sys.exit(1)
+
+          with open("/tmp/pr.diff", "r", encoding="utf-8", errors="replace") as f:
+              diff = f.read()
+          with open("/tmp/review-checks.txt", "r", encoding="utf-8", errors="replace") as f:
+              checks = f.read()
+
+          max_diff_chars = 60000
+          max_check_chars = 20000
+          if len(diff) > max_diff_chars:
+              diff = diff[:max_diff_chars] + "\n\n[Diff truncated because it is too large.]"
+          if len(checks) > max_check_chars:
+              checks = checks[-max_check_chars:] + "\n\n[Check output truncated because it is too large.]"
+
+          endpoint = (
+              base_url
+              if base_url.endswith("/chat/completions")
+              else f"{base_url}/chat/completions"
+          )
+
+          payload = {
+              "model": model,
+              "temperature": 0.2,
+              "max_tokens": 2000,
+              "messages": [
+                  {
+                      "role": "system",
+                      "content": (
+                          "你是严格务实的代码审核 agent。请用中文审核 PR。"
+                          "重点检查：代码规范、可维护性、潜在 bug、功能是否符合 PR 描述、"
+                          "边界条件、错误处理、安全风险、测试缺口。"
+                          "不要编造未出现在 diff 或日志中的事实。"
+                          "如果无法确认功能正常，要明确说只能静态判断，并给出验证建议。"
+                      ),
+                  },
+                  {
+                      "role": "user",
+                      "content": (
+                          f"PR #{os.environ['PR_NUMBER']}: {os.environ['PR_TITLE']}\n\n"
+                          f"PR 描述:\n{os.environ.get('PR_BODY', '')}\n\n"
+                          f"检查命令退出码: {os.environ.get('CHECK_EXIT_CODE', '0')}\n"
+                          f"检查输出:\n{checks}\n\n"
+                          f"PR diff:\n{diff}\n\n"
+                          "请按以下结构输出 Markdown：\n"
+                          "## 结论\n"
+                          "## 必须修复\n"
+                          "## 建议优化\n"
+                          "## 功能验证建议\n"
+                          "如果某一项没有内容，写“暂无”。"
+                      ),
+                  },
+              ],
+          }
+
+          req = urllib.request.Request(
+              endpoint,
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=120) as response:
+                  data = json.loads(response.read().decode("utf-8"))
+          except urllib.error.HTTPError as exc:
+              detail = exc.read().decode("utf-8", errors="replace")
+              print(f"OpenAI-compatible API request failed: HTTP {exc.code}", file=sys.stderr)
+              print(detail, file=sys.stderr)
+              sys.exit(1)
+
+          content = data["choices"][0]["message"]["content"].strip()
+
+          with open("/tmp/review.md", "w", encoding="utf-8") as f:
+              f.write("<!-- code-review-agent -->\n")
+              f.write("## Code Review Agent\n\n")
+              f.write(content)
+              f.write("\n")
+          PY
+
+      - name: Comment review on pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          comment_id="$(
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              --jq '.[] | select(.body | contains("<!-- code-review-agent -->")) | .id' \
+              | tail -n 1
+          )"
+
+          if [ -n "$comment_id" ]; then
+            gh api \
+              --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}" \
+              --field body="$(cat /tmp/review.md)"
+          else
+            gh issue comment "$PR_NUMBER" --body-file /tmp/review.md
+          fi
